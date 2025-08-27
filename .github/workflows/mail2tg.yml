@@ -11,6 +11,7 @@ jobs:
     permissions:
       contents: read
     env:
+      TZ: Asia/Shanghai
       # Actions 环境：一次性执行 + 禁用 state
       DISABLE_STATE: "1"
       POLL_SECONDS: "0"
