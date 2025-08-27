@@ -411,7 +411,7 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 
 	crit := imap.NewSearchCriteria()
 	if params.windowHours <= 0 {
-		params.windowHours = 2
+		params.windowHours = 1
 	}
 	crit.Since = time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
 	if params.unreadOnly {
@@ -551,7 +551,7 @@ func main() {
 		PollSeconds: 0,
 		// Actions 环境：一次性 + 禁用 state
 		DisableState: os.Getenv("GITHUB_ACTIONS") == "true" || os.Getenv("DISABLE_STATE") == "1",
-		WindowHours:  parseIntEnv("WINDOW_HOURS", 2),
+		WindowHours:  parseIntEnv("WINDOW_HOURS", 1),
 		UnreadOnly:   parseBoolEnv("UNREAD_ONLY", true),
 		ApiKey:       os.Getenv("OPENAI_API_KEY"),
 	}
