@@ -116,14 +116,6 @@ func guessIMAPHost(email string) string {
 	}
 }
 
-type MailSummary struct {
-	UID     uint32
-	From    string
-	Subject string
-	Date    time.Time
-	Preview string
-}
-
 func escHTML(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return r.Replace(s)
@@ -282,16 +274,21 @@ func extractTextPlain(r io.Reader) (string, error) {
 	return "", nil
 }
 
-// AI 摘要（可选）：设置 OPENAI_API_KEY 时启用；失败则返回原文
+// summarizeWithAI 使用 Google Gemini 对邮件文本进行摘要。
+// 当 API 调用失败时，它会自动进行重试。
+// apiKey: 从环境变量等配置中获取的 Google AI API Key。
 func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
-	// 1. 从环境变量获取 Google AI API Key
+	const maxRetries = 3                   // 总共尝试次数 (1次初始 + 2次重试)
+	const initialBackoff = 1 * time.Second // 初始退避时间，每次重试递增
+
+	// 1. 预检查：API Key 是否存在
 	if apiKey == "" {
-		fmt.Println("警告: GOOGLE_API_KEY 环境变量未设置。")
+		// 这是一个配置问题，不需要重试，直接返回
+		log.Println("警告: GOOGLE_AI_API_KEY 未设置，跳过AI摘要。")
 		return text
 	}
 
-	// 2. 使用 API Key 初始化 Gemini 客户端
-	// SDK 会处理所有底层的 HTTP 连接和认证
+	// 2. 创建 Gemini 客户端 (只需创建一次)
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		log.Printf("错误: 无法创建 Gemini 客户端: %v", err)
@@ -299,14 +296,12 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	}
 	defer client.Close()
 
-	// 3.选择要使用的模型，并设置生成配置
+	// 3. 配置模型和提示 (只需配置一次)
 	model := client.GenerativeModel("gemini-1.5-flash-latest")
 	model.GenerationConfig = genai.GenerationConfig{
 		Temperature: genai.Ptr(float32(0.2)),
 	}
 
-	// 4. 构建提示 (Prompt)
-	// 这里的 prompt 和之前完全一样，只是传递方式更简单
 	prompt := fmt.Sprintf(
 		"你是一位可爱的资深运营助理，非常擅长将冗长复杂的邮件内容提炼为清晰、可执行的操作可爱清淡清单（emjoil和颜文字）。请你用简洁可爱的中文来回答"+
 			"请把下面的邮件正文压缩为一份不超过800字的纯文本摘（这篇摘要需要发送到tg），摘要中必须保留以下关键信息："+
@@ -315,31 +310,58 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 		text,
 	)
 
-	// 5. 调用 API 生成内容
-	// SDK 会自动将字符串包装成 `genai.Text` 类型
-	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		log.Printf("错误: 内容生成失败: %v", err)
-		return text
-	}
+	// --- 4. [新增] 带重试机制的循环 ---
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// 调用 API 生成内容
+		resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+		if err == nil {
+			// --- 成功路径 ---
+			var summary strings.Builder
+			if len(resp.Candidates) > 0 {
+				for _, part := range resp.Candidates[0].Content.Parts {
+					if txt, ok := part.(genai.Text); ok {
+						summary.WriteString(string(txt))
+					}
+				}
+			}
 
-	// 6. 从响应中提取文本内容
-	// SDK 提供了更简单、更安全的方式来访问结果
-	var summary strings.Builder
-	if len(resp.Candidates) > 0 {
-		for _, part := range resp.Candidates[0].Content.Parts {
-			if txt, ok := part.(genai.Text); ok {
-				summary.WriteString(string(txt))
+			if summary.Len() > 0 {
+				// 成功获取到内容，直接返回
+				return strings.TrimSpace(summary.String())
+			}
+
+			// API调用成功，但未返回内容，这种情况通常不需要重试
+			log.Println("警告: AI 调用成功，但未能返回有效内容。")
+			return text // 直接返回原文
+		}
+
+		// --- 失败路径 ---
+		lastErr = err
+		log.Printf("错误: 内容生成失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
+
+		// 如果不是最后一次尝试，则等待后重试
+		if attempt < maxRetries {
+			// 计算本次等待时间
+			backoffDuration := time.Duration(attempt) * initialBackoff
+			log.Printf("将在 %v 后重试...", backoffDuration)
+
+			// 使用 select 实现上下文感知的等待
+			select {
+			case <-time.After(backoffDuration):
+				// 等待结束，继续下一次循环
+				continue
+			case <-ctx.Done():
+				// 在等待期间，上层 context 被取消
+				log.Printf("错误: Context 在重试等待期间被取消: %v", ctx.Err())
+				return text // 立即中止并返回原文
 			}
 		}
 	}
 
-	if summary.Len() > 0 {
-		return strings.TrimSpace(summary.String())
-	}
-
-	fmt.Println("警告: AI 未能返回有效内容。")
-	return text
+	// --- 所有重试都失败后 ---
+	log.Printf("错误: 所有 %d 次尝试均失败，最终错误: %v", maxRetries, lastErr)
+	return text // 返回原文作为兜底
 }
 
 // Telegram 单条消息最大约 4096 字符，按换行优先分块
@@ -386,12 +408,30 @@ func domainAllowed(host string, allow []string) bool {
 	return false
 }
 
+// searchParams 结构体保持不变
 type searchParams struct {
 	windowHours int
 	unreadOnly  bool
 }
 
+// MailSummary 结构体保持不变（假设存在）
+type MailSummary struct {
+	UID     uint32
+	From    string
+	Subject string
+	Date    time.Time
+	Preview string
+}
+
+// 辅助函数 domainAllowed, guessIMAPHost, extractTextPlain, normalizeSpaces, summarizeWithAI 保持不变（假设存在）
+
+// --- 优化后的 fetchLatest 函数 ---
+
+// fetchLatest 从指定的邮箱中获取邮件。
+// 它首先在服务器上搜索最近 windowHours 内的邮件，然后获取其中最新的 limit 封，
+// 并对这些邮件进行处理（域名过滤、AI摘要等）。
 func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, allowDomains []string, params searchParams, apikey string) ([]MailSummary, uint32, error) {
+	// --- 1. 连接和登录IMAP服务器 (逻辑不变) ---
 	host := mb.IMAP
 	if host == "" {
 		host = guessIMAPHost(mb.Email)
@@ -409,62 +449,76 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		return nil, sinceUID, fmt.Errorf("select INBOX: %w", err)
 	}
 
+	// --- 2. [优化] 高效搜索符合条件的邮件UID ---
 	crit := imap.NewSearchCriteria()
 	if params.windowHours <= 0 {
-		params.windowHours = 1
+		params.windowHours = 1 // 默认至少1小时
 	}
+	// 在服务器端按时间窗口进行搜索，这是最高效的方式
 	crit.Since = time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
 	if params.unreadOnly {
-		// 仅未读（UNSEEN）
 		crit.WithoutFlags = []string{imap.SeenFlag}
 	}
+
 	uids, err := c.UidSearch(crit)
 	if err != nil {
 		return nil, sinceUID, fmt.Errorf("UidSearch: %w", err)
 	}
 	if len(uids) == 0 {
-		return nil, sinceUID, nil
+		return nil, sinceUID, nil // 没有在时间窗口内的新邮件
 	}
 
-	// > sinceUID（若使用 state）
-	filtered := make([]uint32, 0, len(uids))
+	// --- 3. [优化] 过滤、排序并限制UID数量 ---
+	// a. 过滤掉已经处理过的邮件 (UID <= sinceUID)
+	uidsToFetch := make([]uint32, 0, len(uids))
 	for _, id := range uids {
-		if sinceUID == 0 || id > sinceUID {
-			filtered = append(filtered, id)
+		if id > sinceUID {
+			uidsToFetch = append(uidsToFetch, id)
 		}
 	}
-	if len(filtered) == 0 {
-		return nil, sinceUID, nil
-	}
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i] < filtered[j] })
-	if len(filtered) > limit {
-		filtered = filtered[len(filtered)-limit:]
+
+	if len(uidsToFetch) == 0 {
+		return nil, sinceUID, nil // 没有比上次更新的邮件
 	}
 
+	// b. 对UID进行排序（UID越大越新），确保我们能取到最新的
+	sort.Slice(uidsToFetch, func(i, j int) bool { return uidsToFetch[i] < uidsToFetch[j] })
+
+	// c. 如果结果多于limit，只保留最新的 limit 条
+	if len(uidsToFetch) > limit {
+		uidsToFetch = uidsToFetch[len(uidsToFetch)-limit:]
+	}
+
+	// --- 4. 批量抓取已筛选出的邮件内容 (逻辑不变) ---
 	seq := new(imap.SeqSet)
-	seq.AddNum(filtered...)
+	seq.AddNum(uidsToFetch...)
 
-	section := &imap.BodySectionName{} // RFC822
+	section := &imap.BodySectionName{}
 	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, section.FetchItem()}
-	ch := make(chan *imap.Message, len(filtered))
-	go func() { _ = c.UidFetch(seq, items, ch) }()
+
+	messages := make(chan *imap.Message, len(uidsToFetch))
+	done := make(chan error, 1)
+	go func() {
+		done <- c.UidFetch(seq, items, messages)
+	}()
 
 	var res []MailSummary
 	maxUID := sinceUID
 
-	for msg := range ch {
+	// --- 5. 处理每封邮件 (逻辑不变) ---
+	for msg := range messages {
 		if msg == nil || msg.Envelope == nil || msg.Uid == 0 {
 			continue
 		}
-		// 域名白名单
-		ok := false
-		for _, a := range msg.Envelope.From {
-			if domainAllowed(a.HostName, allowDomains) {
-				ok = true
+		// 域名白名单过滤
+		isAllowed := false
+		for _, fromAddr := range msg.Envelope.From {
+			if domainAllowed(fromAddr.HostName, allowDomains) {
+				isAllowed = true
 				break
 			}
 		}
-		if !ok {
+		if !isAllowed {
 			continue
 		}
 
@@ -472,15 +526,7 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 			maxUID = msg.Uid
 		}
 
-		from := "(unknown)"
-		if len(msg.Envelope.From) > 0 {
-			a := msg.Envelope.From[0]
-			if a.PersonalName != "" {
-				from = fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
-			} else {
-				from = fmt.Sprintf("%s@%s", a.MailboxName, a.HostName)
-			}
-		}
+		from := formatFromAddress(msg.Envelope.From)
 
 		preview := ""
 		if body := msg.GetBody(section); body != nil {
@@ -488,13 +534,15 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 				preview = normalizeSpaces(text)
 			}
 		}
-		// 超长先AI摘要（可选）
-		preview = summarizeWithAI(ctx, preview, apikey)
 
-		// 进一步兜底截断，避免进入 TG 才超限
+		// AI摘要 (可选)
+		if apikey != "" {
+			preview = summarizeWithAI(ctx, preview, apikey)
+		}
+
+		// 兜底截断
 		if len([]rune(preview)) > 3800 {
-			rs := []rune(preview)
-			preview = string(rs[:3800]) + "…"
+			preview = string([]rune(preview)[:3800]) + "…"
 		}
 
 		res = append(res, MailSummary{
@@ -506,8 +554,27 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		})
 	}
 
+	if err := <-done; err != nil {
+		return nil, sinceUID, fmt.Errorf("UidFetch failed: %w", err)
+	}
+
+	// --- 6. [优化] 按邮件头中的Date字段进行最终排序 ---
+	// UID代表到达顺序，但邮件本身的Date头可能不同。按Date排序对用户更友好。
 	sort.Slice(res, func(i, j int) bool { return res[i].Date.Before(res[j].Date) })
+
 	return res, maxUID, nil
+}
+
+// 辅助函数：格式化发件人地址 (从原逻辑中提取)
+func formatFromAddress(addrs []*imap.Address) string {
+	if len(addrs) == 0 {
+		return "(unknown)"
+	}
+	a := addrs[0]
+	if a.PersonalName != "" {
+		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
+	}
+	return fmt.Sprintf("%s@%s", a.MailboxName, a.HostName)
 }
 
 func parseBoolEnv(key string, def bool) bool {
