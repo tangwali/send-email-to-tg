@@ -125,10 +125,10 @@ func formatForTG(ms MailSummary, boxName string) string {
 	ts := ms.Date.Local().Format("2006-01-02 15:04:05")
 	// 简洁可读：顶部关键信息 + 正文
 	return fmt.Sprintf(
-		"<b>[%s]</b>\n<b>From:</b> %s\n<b>Subject:</b> %s\n<b>Date:</b> %s\n\n%s",
+		"<b>【%s】%s</b>\n<b>发件人:</b> %s\n<b>发件时间:</b> %s\n\n%s",
 		escHTML(boxName),
-		escHTML(ms.From),
 		escHTML(ms.Subject),
+		escHTML(ms.From),
 		escHTML(ts),
 		escHTML(ms.Preview),
 	)
