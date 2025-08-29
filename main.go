@@ -48,6 +48,7 @@ type Env struct {
 	WindowHours   int
 	UnreadOnly    bool
 	ApiKey        string
+	Model         string
 }
 
 type Mailbox struct {
@@ -237,8 +238,8 @@ func extractTextPlain(r io.Reader) (string, error) {
 // 当 API 调用失败时，它会自动进行重试。
 // apiKey: 从环境变量等配置中获取（使用 OPENAI_API_KEY 存放 Google AI Key）。
 func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
-	const maxRetries = 3                   // 总共尝试次数 (1次初始 + 2次重试)
-	const initialBackoff = 1 * time.Second // 初始退避时间，每次重试递增
+	const maxRetries = 5                   // 尝试次数更充足
+	const initialBackoff = 5 * time.Second // 初始退避时间更长
 
 	// 1. 预检查：API Key 是否存在
 	if apiKey == "" {
@@ -256,19 +257,20 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	defer client.Close()
 
 	// 3. 配置模型和提示 (只需配置一次)
-	model := client.GenerativeModel("gemini-1.5-flash-latest")
+
+	model := client.GenerativeModel("gemini-2.0-flash")
 	model.GenerationConfig = genai.GenerationConfig{
 		Temperature: genai.Ptr(float32(0.2)),
 	}
 
 	prompt := fmt.Sprintf(
-		"你是一位可爱风格的资深运营助理，请把下面的完整邮件信息（含主题/发件人/时间/正文）整理成中文正文，要求："+
-			"1) 采用可爱轻松的语气与颜文字；"+
-			"2) 使用清晰标签逐行列出关键信息 需要简洁精炼"+
+		"你是一位可爱风格的资深运营助理，请把下面的完整邮件信息整理成中文正文，要求："+
+			"1) 采用可爱轻松的语气和合理使用颜文字emoji"+
+			"2) 使用清晰标签逐行列出关键信息需要简洁精炼只需要关键信息注意！只要关注主要信息！！不需要帮助信息 设置信息 以及温馨提示！！！ "+
 			"3) 仅使用换行分隔条目，不要出现空白段落；"+
 			"4) 不要使用 Markdown/HTML，不要粘贴跟踪链接；"+
 			"5) 总长度不超过 800 字；"+
-			"6) 输出只包含摘要正文，不要重复发件人或日期抬头。\n\n邮件内容：\n%s",
+			"6) 注意：输出只包含摘要正文，不要重复发件人或日期抬头。\n\n邮件内容：\n%s",
 		text,
 	)
 
@@ -304,8 +306,8 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 
 		// 如果不是最后一次尝试，则等待后重试
 		if attempt < maxRetries {
-			// 计算本次等待时间
-			backoffDuration := time.Duration(attempt) * initialBackoff
+			// 指数退避：5s,10s,20s,40s ...
+			backoffDuration := time.Duration(1<<uint(attempt-1)) * initialBackoff
 			log.Printf("将在 %v 后重试...", backoffDuration)
 
 			// 使用 select 实现上下文感知的等待
