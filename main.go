@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,13 +25,11 @@ import (
 )
 
 /*
-行为概览
-- 本地：POLL_SECONDS>0 时轮询；=0 时一次性运行；可写 state/state.json 做 UID 去重
-- GitHub Actions：默认一次性执行 (POLL_SECONDS=0) + 禁用 state（DISABLE_STATE=1）
-- 搜索：最近 WINDOW_HOURS（默认2小时） + （可选）仅未读 UNREAD_ONLY=1
+- GitHub Actions：一次性执行；不使用本地状态（不做 UID 去重）
+- 搜索：最近 WINDOW_HOURS（默认1小时） + （可选）仅未读 UNREAD_ONLY=1
 - 过滤：发件域名在 SENDER_DOMAINS 白名单（含子域）
 - 正文：优先 text/plain；否则解析 text/html -> 纯文本（忽略 script/style，压缩空白）
-- 超长：>1200 字尝试调用 OpenAI 摘要（OPENAI_API_KEY），最终按 4096 字分块发送
+- 摘要：配置 OPENAI_API_KEY 时使用 Gemini 做摘要；最终按 4096 字分块发送
 */
 
 type Env struct {
@@ -48,47 +44,10 @@ type Env struct {
 	TGBotToken string
 	TGChatID   string
 
-	PollSeconds  int
-	DisableState bool
-
 	SenderDomains []string
 	WindowHours   int
 	UnreadOnly    bool
 	ApiKey        string
-}
-
-type State struct {
-	LastUID map[string]uint32 `json:"last_uid"`
-}
-
-func loadState(path string) (*State, error) {
-	st := &State{LastUID: map[string]uint32{}}
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return st, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-	_ = json.NewDecoder(f).Decode(st)
-	return st, nil
-}
-
-func saveState(path string, st *State) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := json.NewEncoder(f).Encode(st); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 type Mailbox struct {
@@ -123,9 +82,9 @@ func escHTML(s string) string {
 
 func formatForTG(ms MailSummary, boxName string) string {
 	ts := ms.Date.Local().Format("2006-01-02 15:04:05")
-	// 简洁可读：顶部关键信息 + 正文
+	// 可爱版本：品牌 + 主题；发件人 + 时间；空一行；正文
 	return fmt.Sprintf(
-		"<b>%s【%s】</b>\n\n%s\n %s\n\n%s",
+		"<b>%s【%s】</b>\n\n%s\n%s\n\n%s",
 		escHTML(boxName),
 		escHTML(ms.Subject),
 		escHTML(ms.From),
@@ -276,7 +235,7 @@ func extractTextPlain(r io.Reader) (string, error) {
 
 // summarizeWithAI 使用 Google Gemini 对邮件文本进行摘要。
 // 当 API 调用失败时，它会自动进行重试。
-// apiKey: 从环境变量等配置中获取的 Google AI API Key。
+// apiKey: 从环境变量等配置中获取（使用 OPENAI_API_KEY 存放 Google AI Key）。
 func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	const maxRetries = 3                   // 总共尝试次数 (1次初始 + 2次重试)
 	const initialBackoff = 1 * time.Second // 初始退避时间，每次重试递增
@@ -284,7 +243,7 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	// 1. 预检查：API Key 是否存在
 	if apiKey == "" {
 		// 这是一个配置问题，不需要重试，直接返回
-		log.Println("警告: GOOGLE_AI_API_KEY 未设置，跳过AI摘要。")
+		log.Println("警告: OPENAI_API_KEY 未设置，跳过AI摘要。")
 		return text
 	}
 
@@ -303,10 +262,13 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	}
 
 	prompt := fmt.Sprintf(
-		"你是一位可爱的资深运营助理，非常擅长将冗长复杂的邮件内容提炼为清晰、可执行的操作可爱清淡清单（emjoil和颜文字）。用你可爱的中文来润色回答"+
-			"请把下面的邮件正文压缩为一份不超过800字的纯文本摘（这篇摘要需要发送到tg），摘要中必须保留以下关键信息："+
-			"主题要点、任何相关的订单/货件/工单编号、具体的时间和地点、已知的异常原因、需要团队处理的具体动作、以及明确的截止时间。"+
-			"请确保去掉所有不必要的客套话、装饰性语句和跟踪链接，只保留核心事实和行动项。使用纯文本 注意：不使用md格式 使用紧凑布局 去掉多余的空白行 尽量每行都有文字   \n\n邮件正文如下：\n\n%s",
+		"你是一位可爱风格的资深运营助理，请把下面的完整邮件信息（含主题/发件人/时间/正文）整理成中文正文，要求："+
+			"1) 采用可爱轻松的语气与颜文字；"+
+			"2) 使用清晰标签逐行列出关键信息 需要简洁精炼"+
+			"3) 仅使用换行分隔条目，不要出现空白段落；"+
+			"4) 不要使用 Markdown/HTML，不要粘贴跟踪链接；"+
+			"5) 总长度不超过 800 字；"+
+			"6) 输出只包含摘要正文，不要重复发件人或日期抬头。\n\n邮件内容：\n%s",
 		text,
 	)
 
@@ -526,10 +488,6 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		if msg.Uid > maxUID {
 			maxUID = msg.Uid
 		}
-		// 如果服务器接收时间在一小时以前，则跳过
-		if msg.InternalDate.Before(time.Now().Add(-1 * time.Hour)) {
-			continue
-		}
 
 		from := formatFromAddress(msg.Envelope.From)
 
@@ -537,12 +495,22 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		if body := msg.GetBody(section); body != nil {
 			if text, err := extractTextPlain(body); err == nil {
 				preview = normalizeSpaces(text)
+				preview = removeEmptyLines(preview)
 			}
 		}
 
-		// AI摘要 (可选)
+		// AI摘要 (可选) —— 将主题/发件人/时间与正文一起交给 AI，产出“可爱、带标签”的摘要正文
 		if apikey != "" {
-			preview = summarizeWithAI(ctx, preview, apikey)
+			mailCtx := fmt.Sprintf("主题: %s\n发件人: %s\n时间: %s\n\n正文:\n%s",
+				strings.TrimSpace(msg.Envelope.Subject),
+				formatFromAddress(msg.Envelope.From),
+				msg.Envelope.Date.Local().Format("2006-01-02 15:04:05"),
+				preview,
+			)
+			preview = summarizeWithAI(ctx, mailCtx, apikey)
+			// 统一压缩空白并移除空行，避免两行之间出现额外空白
+			preview = normalizeSpaces(preview)
+			preview = removeEmptyLines(preview)
 		}
 
 		// 兜底截断
@@ -572,14 +540,26 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 
 // 辅助函数：格式化发件人地址 (从原逻辑中提取)
 func formatFromAddress(addrs []*imap.Address) string {
+	// 仅返回邮箱地址，不包含显示名
 	if len(addrs) == 0 {
 		return "(unknown)"
 	}
 	a := addrs[0]
-	if a.PersonalName != "" {
-		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
-	}
 	return fmt.Sprintf("%s@%s", a.MailboxName, a.HostName)
+}
+
+// removeEmptyLines 去掉所有空白行，确保行与行之间没有多余的空行
+func removeEmptyLines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }
 
 func parseBoolEnv(key string, def bool) bool {
@@ -620,17 +600,9 @@ func main() {
 		Mail2IMAP:   os.Getenv("GMAIL_IMAP_HOST"),
 		TGBotToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TGChatID:    os.Getenv("TELEGRAM_CHAT_ID"),
-		PollSeconds: 0,
-		// Actions 环境：一次性 + 禁用 state
-		DisableState: os.Getenv("GITHUB_ACTIONS") == "true" || os.Getenv("DISABLE_STATE") == "1",
-		WindowHours:  parseIntEnv("WINDOW_HOURS", 1),
-		UnreadOnly:   parseBoolEnv("UNREAD_ONLY", true),
-		ApiKey:       os.Getenv("OPENAI_API_KEY"),
-	}
-	if v := strings.TrimSpace(os.Getenv("POLL_SECONDS")); v != "" {
-		if d, err := time.ParseDuration(v + "s"); err == nil {
-			env.PollSeconds = int(d.Seconds())
-		}
+		WindowHours: parseIntEnv("WINDOW_HOURS", 1),
+		UnreadOnly:  parseBoolEnv("UNREAD_ONLY", true),
+		ApiKey:      os.Getenv("OPENAI_API_KEY"),
 	}
 	// 发件域白名单
 	domains := strings.Split(os.Getenv("SENDER_DOMAINS"), ",")
@@ -658,26 +630,11 @@ func main() {
 		log.Fatal("未配置任何邮箱凭据（QQ 或 Gmail 至少一个）")
 	}
 
-	statePath := "state/state.json"
-	var st *State
-	var err error
-	if env.DisableState {
-		st = &State{LastUID: map[string]uint32{}}
-	} else {
-		st, err = loadState(statePath)
-		if err != nil {
-			log.Fatalf("加载状态失败: %v", err)
-		}
-	}
-
 	runOnce := func() {
 		ctx := context.Background()
 		for _, mb := range mbs {
 			func() {
-				var since uint32
-				if !env.DisableState {
-					since = st.LastUID[mb.Email]
-				}
+				var since uint32 = 0 // 一次性运行：不做 UID 去重
 				msgs, maxUID, err := fetchLatest(
 					ctx,
 					mb,
@@ -705,25 +662,10 @@ func main() {
 					}
 					log.Printf("[%s] 已推送 UID=%d %s", mb.Email, ms.UID, ms.Subject)
 				}
-				if !env.DisableState && maxUID > since {
-					st.LastUID[mb.Email] = maxUID
-					if err := saveState(statePath, st); err != nil {
-						log.Printf("保存状态失败: %v", err)
-					}
-				}
+				_ = maxUID // 单次运行无需保存状态
 			}()
 		}
 	}
-
-	if env.PollSeconds <= 0 {
-		runOnce()
-		return
-	}
-	ticker := time.NewTicker(time.Duration(env.PollSeconds) * time.Second)
-	defer ticker.Stop()
-	log.Printf("mail2tg 轮询中，间隔 %ds", env.PollSeconds)
-	for {
-		runOnce()
-		<-ticker.C
-	}
+	// GitHub Action: 一次性执行并退出
+	runOnce()
 }
