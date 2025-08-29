@@ -125,10 +125,9 @@ func formatForTG(ms MailSummary, boxName string) string {
 	ts := ms.Date.Local().Format("2006-01-02 15:04:05")
 	// 简洁可读：顶部关键信息 + 正文
 	return fmt.Sprintf(
-		"<b>【%s】%s</b>\n\n%s\n %s\n\n%s",
+		"<b>%s【%s】</b>\n\n%s\n %s\n\n%s",
 		escHTML(boxName),
 		escHTML(ms.Subject),
-
 		escHTML(ms.From),
 		escHTML(ts),
 		escHTML(ms.Preview),
@@ -304,10 +303,10 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	}
 
 	prompt := fmt.Sprintf(
-		"你是一位可爱的资深运营助理，非常擅长将冗长复杂的邮件内容提炼为清晰、可执行的操作可爱清淡清单（emjoil和颜文字）。请你用简洁可爱的中文来回答"+
+		"你是一位可爱的资深运营助理，非常擅长将冗长复杂的邮件内容提炼为清晰、可执行的操作可爱清淡清单（emjoil和颜文字）。用你可爱的中文来润色回答"+
 			"请把下面的邮件正文压缩为一份不超过800字的纯文本摘（这篇摘要需要发送到tg），摘要中必须保留以下关键信息："+
 			"主题要点、任何相关的订单/货件/工单编号、具体的时间和地点、已知的异常原因、需要团队处理的具体动作、以及明确的截止时间。"+
-			"请确保去掉所有不必要的客套话、装饰性语句和跟踪链接，只保留核心事实和行动项。使用纯文本 不使用md格式 \n\n邮件正文如下：\n\n%s",
+			"请确保去掉所有不必要的客套话、装饰性语句和跟踪链接，只保留核心事实和行动项。使用纯文本 注意：不使用md格式 使用紧凑布局 去掉多余的空白行 尽量每行都有文字   \n\n邮件正文如下：\n\n%s",
 		text,
 	)
 
@@ -495,7 +494,8 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 	seq.AddNum(uidsToFetch...)
 
 	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, section.FetchItem()}
+	// 需要 INTERNALDATE 用于按服务器接收时间过滤
+	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, imap.FetchInternalDate, section.FetchItem()}
 
 	messages := make(chan *imap.Message, len(uidsToFetch))
 	done := make(chan error, 1)
@@ -525,6 +525,10 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 
 		if msg.Uid > maxUID {
 			maxUID = msg.Uid
+		}
+		// 如果服务器接收时间在一小时以前，则跳过
+		if msg.InternalDate.Before(time.Now().Add(-1 * time.Hour)) {
+			continue
 		}
 
 		from := formatFromAddress(msg.Envelope.From)
