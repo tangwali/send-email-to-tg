@@ -88,8 +88,8 @@ func formatForTG(ms MailSummary, boxName string) string {
 		"<b>%s【%s】</b>\n\n%s\n%s\n\n%s",
 		escHTML(boxName),
 		escHTML(ms.Subject),
+		escHTML(ts), // 这里使用 ms.Date
 		escHTML(ms.From),
-		escHTML(ts),
 		escHTML(ms.Preview),
 	)
 }
@@ -266,7 +266,7 @@ func summarizeWithAI(ctx context.Context, text string, apiKey string) string {
 	prompt := fmt.Sprintf(
 		"你是一位可爱风格的资深运营助理，请把下面的完整邮件信息整理成中文正文，要求："+
 			"1) 采用可爱轻松的语气和合理使用颜文字emoji"+
-			"2) 使用清晰标签逐行列出关键信息需要简洁精炼只需要关键信息注意！只要关注主要信息！！不需要帮助信息 设置信息 以及温馨提示！！！ "+
+			"2) 使用清晰标签逐行列出关键信息需要简洁精炼只需要关键信息注意！只要关注主要信息！！！不需要帮助信息 设置信息 以及温馨提示！！！ "+
 			"3) 仅使用换行分隔条目，不要出现空白段落；"+
 			"4) 不要使用 Markdown/HTML，不要粘贴跟踪链接；"+
 			"5) 总长度不超过 800 字；"+
@@ -383,7 +383,7 @@ type MailSummary struct {
 	UID     uint32
 	From    string
 	Subject string
-	Date    time.Time
+	Date    time.Time // 添加 InternalDate 字段
 	Preview string
 }
 
@@ -419,7 +419,9 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		params.windowHours = 1 // 默认至少1小时
 	}
 	// 在服务器端按时间窗口进行搜索，这是最高效的方式
-	crit.Since = time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
+	searchCutoff := time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
+	crit.Since = searchCutoff // 在服务器端进行初步筛选
+
 	if params.unreadOnly {
 		crit.WithoutFlags = []string{imap.SeenFlag}
 	}
@@ -475,6 +477,12 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 		if msg == nil || msg.Envelope == nil || msg.Uid == 0 {
 			continue
 		}
+
+		// 再次检查服务器接收时间，确保严格在 windowHours 内
+		if msg.InternalDate.Before(searchCutoff) {
+			continue // 跳过早于窗口时间的邮件
+		}
+
 		// 域名白名单过滤
 		isAllowed := false
 		for _, fromAddr := range msg.Envelope.From {
@@ -506,7 +514,7 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 			mailCtx := fmt.Sprintf("主题: %s\n发件人: %s\n时间: %s\n\n正文:\n%s",
 				strings.TrimSpace(msg.Envelope.Subject),
 				formatFromAddress(msg.Envelope.From),
-				msg.Envelope.Date.Local().Format("2006-01-02 15:04:05"),
+				msg.InternalDate.Local().Format("2006-01-02 15:04:05"), // 使用 InternalDate
 				preview,
 			)
 			preview = summarizeWithAI(ctx, mailCtx, apikey)
@@ -524,7 +532,7 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 			UID:     msg.Uid,
 			From:    from,
 			Subject: msg.Envelope.Subject,
-			Date:    msg.Envelope.Date,
+			Date:    msg.InternalDate, // 使用 InternalDate
 			Preview: preview,
 		})
 	}
