@@ -422,9 +422,9 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 	searchCutoff := time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
 	crit.Since = searchCutoff // 在服务器端进行初步筛选
 
-	if params.unreadOnly {
-		crit.WithoutFlags = []string{imap.SeenFlag}
-	}
+	// if params.unreadOnly {
+	// 	crit.WithoutFlags = []string{imap.SeenFlag}
+	// }
 
 	uids, err := c.UidSearch(crit)
 	if err != nil {
