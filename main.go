@@ -46,7 +46,6 @@ type Env struct {
 
 	SenderDomains []string
 	WindowHours   int
-	UnreadOnly    bool
 	ApiKey        string
 	Model         string
 }
@@ -375,7 +374,6 @@ func domainAllowed(host string, allow []string) bool {
 // searchParams 结构体保持不变
 type searchParams struct {
 	windowHours int
-	unreadOnly  bool
 }
 
 // MailSummary 结构体保持不变（假设存在）
@@ -421,10 +419,7 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 	// 在服务器端按时间窗口进行搜索，这是最高效的方式
 	searchCutoff := time.Now().Add(-time.Duration(params.windowHours) * time.Hour)
 	crit.Since = searchCutoff // 在服务器端进行初步筛选
-
-	// if params.unreadOnly {
-	// 	crit.WithoutFlags = []string{imap.SeenFlag}
-	// }
+	crit.WithoutFlags = []string{imap.SeenFlag}
 
 	uids, err := c.UidSearch(crit)
 	if err != nil {
@@ -474,12 +469,13 @@ func fetchLatest(ctx context.Context, mb Mailbox, sinceUID uint32, limit int, al
 
 	// --- 5. 处理每封邮件 (逻辑不变) ---
 	for msg := range messages {
+		fmt.Println(msg.Uid, msg.Envelope.Subject, msg.InternalDate)
 		if msg == nil || msg.Envelope == nil || msg.Uid == 0 {
 			continue
 		}
 
 		// 再次检查服务器接收时间，确保严格在 windowHours 内
-		if msg.InternalDate.Before(searchCutoff) {
+		if msg.InternalDate.Before(time.Now().Add(-90 * time.Minute)) {
 			continue // 跳过早于窗口时间的邮件
 		}
 
@@ -611,7 +607,6 @@ func main() {
 		TGBotToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TGChatID:    os.Getenv("TELEGRAM_CHAT_ID"),
 		WindowHours: parseIntEnv("WINDOW_HOURS", 1),
-		UnreadOnly:  parseBoolEnv("UNREAD_ONLY", false),
 		ApiKey:      os.Getenv("OPENAI_API_KEY"),
 	}
 	// 发件域白名单
@@ -651,7 +646,7 @@ func main() {
 					since,
 					80, // 每次最多取 80
 					env.SenderDomains,
-					searchParams{windowHours: env.WindowHours, unreadOnly: env.UnreadOnly},
+					searchParams{windowHours: env.WindowHours},
 					env.ApiKey,
 				)
 				if err != nil {
@@ -659,7 +654,7 @@ func main() {
 					return
 				}
 				if len(msgs) == 0 {
-					log.Printf("[%s] 无匹配新邮件", mb.Email)
+					log.Printf("[%s] 无匹配邮件", mb.Email)
 					return
 				}
 				for _, ms := range msgs {
