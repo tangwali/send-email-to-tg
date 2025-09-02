@@ -611,7 +611,7 @@ func main() {
 		TGBotToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TGChatID:    os.Getenv("TELEGRAM_CHAT_ID"),
 		WindowHours: parseIntEnv("WINDOW_HOURS", 1),
-		UnreadOnly:  parseBoolEnv("UNREAD_ONLY", true),
+		UnreadOnly:  parseBoolEnv("UNREAD_ONLY", false),
 		ApiKey:      os.Getenv("OPENAI_API_KEY"),
 	}
 	// 发件域白名单
