@@ -3,9 +3,11 @@ package imapwatcher
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -29,6 +31,20 @@ type MailSummary struct {
 	Preview string
 }
 
+func isDeadConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 兼容多种实现与不同平台文案
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "connection reset by peer") ||
+		strings.Contains(s, "read: connection timed out") ||
+		strings.Contains(s, "write: connection timed out") ||
+		errors.Is(err, net.ErrClosed)
+}
+
 func formatForTG(ms MailSummary, boxName string) string {
 	ts := ms.Date.Local().Format("2006-01-02 15:04:05")
 	return fmt.Sprintf(
@@ -43,17 +59,25 @@ func formatForTG(ms MailSummary, boxName string) string {
 
 func Run(ctx context.Context, mb config.Mailbox, cfg *config.Config) error {
 	telegram.New(cfg.TGBotToken, cfg.TGChatID)
+
 	idlePoll := cfg.IdleFallbackPollSec
 	if idlePoll < 30 {
 		idlePoll = 60
 	}
-
-	lastSeenUID := uint32(0)
 	backoff := cfg.ReconnectBackoff
 	if backoff <= 0 {
 		backoff = 10 * time.Second
 	}
 
+	lastSeenUID := uint32(0)
+
+	host := mb.IMAP
+	if strings.TrimSpace(host) == "" {
+		host = util.GuessIMAPHost(mb.Email) // 自动推导
+	}
+	serverName := strings.Split(host, ":")[0]
+
+outer: // ←—— 关键：外层重连标签
 	for {
 		select {
 		case <-ctx.Done():
@@ -61,59 +85,78 @@ func Run(ctx context.Context, mb config.Mailbox, cfg *config.Config) error {
 		default:
 		}
 
-		host := mb.IMAP
-		if strings.TrimSpace(host) == "" {
-			host = util.GuessIMAPHost(mb.Email) // 自动推导
-		}
-		serverName := strings.Split(host, ":")[0]
-
 		log.Printf("[%s] connect %s ...", mb.Email, host)
-		c, err := client.DialTLS(host, &tls.Config{ServerName: serverName})
+
+		// 使用自定义 Dialer 打开 TCP KeepAlive 和拨号超时
+		dialer := &net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		tlsCfg := &tls.Config{
+			ServerName:         serverName,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: false,
+		}
+
+		// go-imap/client 没有直接暴露 Dialer 版本的 TLS 入口，这里用底层 tls.DialWithDialer
+		conn, err := tls.DialWithDialer(dialer, "tcp", host, tlsCfg)
 		if err != nil {
 			log.Printf("[%s] dial error: %v", mb.Email, err)
 			sleep(ctx, backoff)
 			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue
+			continue outer
 		}
-		backoff = cfg.ReconnectBackoff
 
+		c, err := client.New(conn)
+		if err != nil {
+			log.Printf("[%s] make client error: %v", mb.Email, err)
+			_ = conn.Close()
+			sleep(ctx, backoff)
+			backoff = minDuration(backoff*2, 10*time.Minute)
+			continue outer
+		}
+		// 可选：开启 Debug
+		// c.SetDebug(os.Stdout)
+
+		// 登录
 		if err := c.Login(mb.Email, mb.Password); err != nil {
 			_ = c.Logout()
 			log.Printf("[%s] login error: %v", mb.Email, err)
 			sleep(ctx, backoff)
 			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue
+			continue outer
 		}
+		backoff = cfg.ReconnectBackoff
 		log.Printf("[%s] logged in", mb.Email)
 
 		// 选择 INBOX
-		_, err = c.Select(imap.InboxName, false)
-		if err != nil {
+		if _, err := c.Select(imap.InboxName, false); err != nil {
 			_ = c.Logout()
 			log.Printf("[%s] select inbox: %v", mb.Email, err)
 			sleep(ctx, backoff)
 			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue
+			continue outer
 		}
 
-		// 启动时抓取一次最近窗口
+		// 启动抓取一次
 		if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
+			if isDeadConnErr(err) {
+				log.Printf("[%s] initial fetch dead conn: %v", mb.Email, err)
+				_ = c.Logout()
+				sleep(ctx, backoff)
+				continue outer // 立刻重连
+			}
 			log.Printf("[%s] initial fetch error: %v", mb.Email, err)
 		}
 
-		// 是否支持 IDLE
-		// 尝试进入 IDLE（旧版 go-imap-idle API：用 stop chan 控制退出）
+		// IDLE
 		idler := idleExt.NewClient(c)
-		log.Printf("[%s] entering IDLE ...", mb.Email)
 		updates := make(chan client.Update, 10)
 		c.Updates = updates
 
-		keepalive := time.Duration(cfg.IdleKeepaliveSec) * time.Second
-
-		// 启动一次 IDLE，会在 stop 关闭或超时/错误时返回
+		keepalive := time.Duration(max(30, cfg.IdleKeepaliveSec)) * time.Second
 		startIdle := func(stop <-chan struct{}, errCh chan<- error) {
 			go func() {
-				// 旧 API：IdleWithFallback(stop <-chan struct{}, timeout time.Duration) error
 				errCh <- idler.IdleWithFallback(stop, keepalive)
 			}()
 		}
@@ -121,82 +164,61 @@ func Run(ctx context.Context, mb config.Mailbox, cfg *config.Config) error {
 		stop := make(chan struct{})
 		idleErrCh := make(chan error, 1)
 		startIdle(stop, idleErrCh)
+		log.Printf("[%s] entering IDLE ...", mb.Email)
 
-		// 事件循环：收到 EXISTS/RECENT 等更新时抓取；若 IDLE 返回错误，按需退回轮询或重连
 	idleLoop:
 		for {
 			select {
 			case <-ctx.Done():
-				close(stop) // 退出 IDLE
+				close(stop)
 				_ = c.Logout()
 				return nil
 
 			case err := <-idleErrCh:
-				// 如果返回“不支持 IDLE”等错误，则回退到轮询
+				// 任何 IDLE 结束都兜底抓一次
 				if err != nil {
 					log.Printf("[%s] IDLE ended: %v", mb.Email, err)
 				} else {
 					log.Printf("[%s] IDLE ended normally", mb.Email)
 				}
-				// 尝试一次抓取，避免错过
 				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					log.Printf("[%s] fetch error after IDLE end: %v", mb.Email, err)
+					if isDeadConnErr(err) {
+						log.Printf("[%s] fetch after IDLE dead conn: %v", mb.Email, err)
+						_ = c.Logout()
+						sleep(ctx, backoff)
+						continue outer // 重连
+					}
+					log.Printf("[%s] fetch after IDLE error: %v", mb.Email, err)
 				}
-				// 回退到轮询模式（老服务器/网关都稳）
-				break idleLoop
+				break idleLoop // 回退到轮询（有些服务商不稳定）
 
 			case u := <-updates:
-				// 任意更新先退出当前 IDLE，再抓取，然后重新进入
-				switch u.(type) {
-				case *client.MessageUpdate, *client.MailboxUpdate:
-					// 退出本轮 IDLE
-					select {
-					case <-stop: // 已经关闭
-					default:
-						close(stop)
-					}
-					if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-						log.Printf("[%s] fetch error: %v", mb.Email, err)
-					}
-					// 重启一轮 IDLE
-					stop = make(chan struct{})
-					idleErrCh = make(chan error, 1)
-					startIdle(stop, idleErrCh)
+				// 收到更新：退出本轮 IDLE -> 抓取 -> 重启 IDLE
+				select {
+				case <-stop:
 				default:
-					// 其他更新也同样处理
-					select {
-					case <-stop:
-					default:
-						close(stop)
-					}
-					if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-						log.Printf("[%s] fetch error: %v", mb.Email, err)
-					}
-					stop = make(chan struct{})
-					idleErrCh = make(chan error, 1)
-					startIdle(stop, idleErrCh)
+					close(stop)
 				}
-			}
-		}
-		// IDLE 不可用或已结束 -> 回退轮询
-		log.Printf("[%s] server has no stable IDLE, fallback to polling %ds ...", mb.Email, idlePoll)
-		for {
-			select {
-			case <-ctx.Done():
-				_ = c.Logout()
-				return nil
-			case <-time.After(time.Duration(jitterSec(idlePoll)) * time.Second):
 				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					log.Printf("[%s] fetch error: %v", mb.Email, err)
-					_ = c.Logout()
-					sleep(ctx, backoff)
-					break
+					if isDeadConnErr(err) {
+						log.Printf("[%s] fetch in IDLE dead conn: %v", mb.Email, err)
+						_ = c.Logout()
+						sleep(ctx, backoff)
+						continue outer // 重连
+					}
+					log.Printf("[%s] fetch in IDLE error: %v", mb.Email, err)
 				}
+				// 重启 IDLE
+				stop = make(chan struct{})
+				idleErrCh = make(chan error, 1)
+				startIdle(stop, idleErrCh)
+
+				_ = u // 不用具体类型分支，统一处理
 			}
 		}
 
-		// Fallback: 轮询
-		log.Printf("[%s] server has no IDLE, fallback to polling %ds ...", mb.Email, idlePoll)
+		// ========== 轮询回退 ==========
+	polling:
 		for {
 			select {
 			case <-ctx.Done():
@@ -204,11 +226,22 @@ func Run(ctx context.Context, mb config.Mailbox, cfg *config.Config) error {
 				return nil
 			case <-time.After(time.Duration(jitterSec(idlePoll)) * time.Second):
 				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					log.Printf("[%s] fetch error: %v", mb.Email, err)
+					log.Printf("[%s] fetch error (polling): %v", mb.Email, err)
 					_ = c.Logout()
 					sleep(ctx, backoff)
-					break
+					continue outer // ←—— 关键：真正重连，而不是 break 掉 select
 				}
+				// 可选：发送 NOOP 作为 keepalive，降低被动超时概率
+				if err := c.Noop(); err != nil {
+					if isDeadConnErr(err) {
+						log.Printf("[%s] NOOP dead conn: %v", mb.Email, err)
+						_ = c.Logout()
+						sleep(ctx, backoff)
+						continue outer
+					}
+					log.Printf("[%s] NOOP error: %v", mb.Email, err)
+				}
+				continue polling
 			}
 		}
 	}
