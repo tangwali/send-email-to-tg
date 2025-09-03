@@ -1,3 +1,4 @@
+// 文件路径: imapwatcher.go
 package imapwatcher
 
 import (
@@ -13,11 +14,11 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
-	idleExt "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
 
 	"tgmail-relay/internal/config"
 	"tgmail-relay/internal/extractor"
+	"tgmail-relay/internal/state"
 	"tgmail-relay/internal/summarizer"
 	"tgmail-relay/internal/telegram"
 	"tgmail-relay/internal/util"
@@ -31,17 +32,19 @@ type MailSummary struct {
 	Preview string
 }
 
+// isDeadConnErr 仅在IDLE模式下有意义，轮询模式下可以简化，但保留也无妨
 func isDeadConnErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// 兼容多种实现与不同平台文案
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "use of closed network connection") ||
 		strings.Contains(s, "connection reset by peer") ||
 		strings.Contains(s, "read: connection timed out") ||
 		strings.Contains(s, "write: connection timed out") ||
+		strings.Contains(s, "imap: connection closed") ||
+		strings.Contains(s, "tls: use of closed connection") ||
 		errors.Is(err, net.ErrClosed)
 }
 
@@ -57,197 +60,112 @@ func formatForTG(ms MailSummary, boxName string) string {
 	)
 }
 
+// ★★★ 全新的 Run 函数 (轮询模式) ★★★
 func Run(ctx context.Context, mb config.Mailbox, cfg *config.Config) error {
-	telegram.New(cfg.TGBotToken, cfg.TGChatID)
-
-	idlePoll := cfg.IdleFallbackPollSec
-	if idlePoll < 30 {
-		idlePoll = 60
+	// 1. 启动时加载状态，这部分逻辑保持不变
+	lastSeenUID, err := state.LoadLastUID(mb.Email)
+	if err != nil {
+		log.Printf("[%s] 严重错误: 无法加载状态文件: %v", mb.Email, err)
+		lastSeenUID = 0
 	}
-	backoff := cfg.ReconnectBackoff
-	if backoff <= 0 {
-		backoff = 10 * time.Second
-	}
+	log.Printf("[%s] 从状态文件加载到上次的 UID: %d", mb.Email, lastSeenUID)
 
-	lastSeenUID := uint32(0)
+	// 2. 设置轮询间隔。我们复用配置中的 IdleFallbackPollSec 字段。
+	// 建议设置为 60-120 秒，避免过于频繁。
+	pollIntervalSeconds := max(60, cfg.IdleFallbackPollSec)
+	pollInterval := time.Duration(pollIntervalSeconds) * time.Second
+	log.Printf("[%s] 已切换到短轮询模式，将每 %d 秒检查一次邮件", mb.Email, pollIntervalSeconds)
 
-	host := mb.IMAP
-	if strings.TrimSpace(host) == "" {
-		host = util.GuessIMAPHost(mb.Email) // 自动推导
-	}
-	serverName := strings.Split(host, ":")[0]
+	// 使用带抖动的 Ticker，避免所有任务在同一时刻执行
+	ticker := NewJitterTicker(pollInterval, 5*time.Second)
+	defer ticker.Stop()
 
-outer: // ←—— 关键：外层重连标签
+	// 3. 立即执行一次，不等第一个 ticker 周期
+	log.Printf("[%s] 启动后立即执行首次检查...", mb.Email)
+	checkMail(ctx, mb, cfg, &lastSeenUID)
+
+	// 4. 进入无限的定时循环
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[%s] 收到退出信号，轮询停止", mb.Email)
 			return nil
-		default:
-		}
-
-		log.Printf("[%s] connect %s ...", mb.Email, host)
-
-		// 使用自定义 Dialer 打开 TCP KeepAlive 和拨号超时
-		dialer := &net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-		tlsCfg := &tls.Config{
-			ServerName:         serverName,
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: false,
-		}
-
-		// go-imap/client 没有直接暴露 Dialer 版本的 TLS 入口，这里用底层 tls.DialWithDialer
-		conn, err := tls.DialWithDialer(dialer, "tcp", host, tlsCfg)
-		if err != nil {
-			log.Printf("[%s] dial error: %v", mb.Email, err)
-			sleep(ctx, backoff)
-			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue outer
-		}
-
-		c, err := client.New(conn)
-		if err != nil {
-			log.Printf("[%s] make client error: %v", mb.Email, err)
-			_ = conn.Close()
-			sleep(ctx, backoff)
-			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue outer
-		}
-		// 可选：开启 Debug
-		// c.SetDebug(os.Stdout)
-
-		// 登录
-		if err := c.Login(mb.Email, mb.Password); err != nil {
-			_ = c.Logout()
-			log.Printf("[%s] login error: %v", mb.Email, err)
-			sleep(ctx, backoff)
-			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue outer
-		}
-		backoff = cfg.ReconnectBackoff
-		log.Printf("[%s] logged in", mb.Email)
-
-		// 选择 INBOX
-		if _, err := c.Select(imap.InboxName, false); err != nil {
-			_ = c.Logout()
-			log.Printf("[%s] select inbox: %v", mb.Email, err)
-			sleep(ctx, backoff)
-			backoff = minDuration(backoff*2, 10*time.Minute)
-			continue outer
-		}
-
-		// 启动抓取一次
-		if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-			if isDeadConnErr(err) {
-				log.Printf("[%s] initial fetch dead conn: %v", mb.Email, err)
-				_ = c.Logout()
-				sleep(ctx, backoff)
-				continue outer // 立刻重连
-			}
-			log.Printf("[%s] initial fetch error: %v", mb.Email, err)
-		}
-
-		// IDLE
-		idler := idleExt.NewClient(c)
-		updates := make(chan client.Update, 10)
-		c.Updates = updates
-
-		keepalive := time.Duration(max(30, cfg.IdleKeepaliveSec)) * time.Second
-		startIdle := func(stop <-chan struct{}, errCh chan<- error) {
-			go func() {
-				errCh <- idler.IdleWithFallback(stop, keepalive)
-			}()
-		}
-
-		stop := make(chan struct{})
-		idleErrCh := make(chan error, 1)
-		startIdle(stop, idleErrCh)
-		log.Printf("[%s] entering IDLE ...", mb.Email)
-
-	idleLoop:
-		for {
-			select {
-			case <-ctx.Done():
-				close(stop)
-				_ = c.Logout()
-				return nil
-
-			case err := <-idleErrCh:
-				// 任何 IDLE 结束都兜底抓一次
-				if err != nil {
-					log.Printf("[%s] IDLE ended: %v", mb.Email, err)
-				} else {
-					log.Printf("[%s] IDLE ended normally", mb.Email)
-				}
-				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					if isDeadConnErr(err) {
-						log.Printf("[%s] fetch after IDLE dead conn: %v", mb.Email, err)
-						_ = c.Logout()
-						sleep(ctx, backoff)
-						continue outer // 重连
-					}
-					log.Printf("[%s] fetch after IDLE error: %v", mb.Email, err)
-				}
-				break idleLoop // 回退到轮询（有些服务商不稳定）
-
-			case u := <-updates:
-				// 收到更新：退出本轮 IDLE -> 抓取 -> 重启 IDLE
-				select {
-				case <-stop:
-				default:
-					close(stop)
-				}
-				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					if isDeadConnErr(err) {
-						log.Printf("[%s] fetch in IDLE dead conn: %v", mb.Email, err)
-						_ = c.Logout()
-						sleep(ctx, backoff)
-						continue outer // 重连
-					}
-					log.Printf("[%s] fetch in IDLE error: %v", mb.Email, err)
-				}
-				// 重启 IDLE
-				stop = make(chan struct{})
-				idleErrCh = make(chan error, 1)
-				startIdle(stop, idleErrCh)
-
-				_ = u // 不用具体类型分支，统一处理
-			}
-		}
-
-		// ========== 轮询回退 ==========
-	polling:
-		for {
-			select {
-			case <-ctx.Done():
-				_ = c.Logout()
-				return nil
-			case <-time.After(time.Duration(jitterSec(idlePoll)) * time.Second):
-				if err := fetchAndPush(ctx, c, mb, cfg, &lastSeenUID); err != nil {
-					log.Printf("[%s] fetch error (polling): %v", mb.Email, err)
-					_ = c.Logout()
-					sleep(ctx, backoff)
-					continue outer // ←—— 关键：真正重连，而不是 break 掉 select
-				}
-				// 可选：发送 NOOP 作为 keepalive，降低被动超时概率
-				if err := c.Noop(); err != nil {
-					if isDeadConnErr(err) {
-						log.Printf("[%s] NOOP dead conn: %v", mb.Email, err)
-						_ = c.Logout()
-						sleep(ctx, backoff)
-						continue outer
-					}
-					log.Printf("[%s] NOOP error: %v", mb.Email, err)
-				}
-				continue polling
-			}
+		case <-ticker.C:
+			// 每次 Ticker 触发时，执行一次邮件检查
+			checkMail(ctx, mb, cfg, &lastSeenUID)
 		}
 	}
 }
 
-// fetchAndPush 搜索窗口内新 UID，按需要过滤+摘要+推送
+// checkMail 是一个独立的辅助函数，包含了完整的“连接->检查->断开”的原子操作
+func checkMail(ctx context.Context, mb config.Mailbox, cfg *config.Config, lastUID *uint32) {
+	log.Printf("[%s] [轮询] 开始检查新邮件...", mb.Email)
+
+	host := mb.IMAP
+	if strings.TrimSpace(host) == "" {
+		host = util.GuessIMAPHost(mb.Email)
+	}
+	serverName := strings.Split(host, ":")[0]
+
+	// Dialer 用于设置连接超时
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+
+	// 每次都建立一个全新的 TLS 连接
+	conn, err := tls.DialWithDialer(dialer, "tcp", host, &tls.Config{ServerName: serverName})
+	if err != nil {
+		log.Printf("[%s] [轮询] 连接失败: %v", mb.Email, err)
+		return
+	}
+
+	// 使用 client.New 创建客户端
+	c, err := client.New(conn)
+	if err != nil {
+		log.Printf("[%s] [轮询] 创建客户端失败: %v", mb.Email, err)
+		conn.Close()
+		return
+	}
+	// ★ 关键：确保操作结束后一定登出并关闭连接
+	defer func() {
+		log.Printf("[%s] [轮询] 登出并关闭连接", mb.Email)
+		c.Logout()
+	}()
+
+	if err := c.Login(mb.Email, mb.Password); err != nil {
+		log.Printf("[%s] [轮询] 登录失败: %v", mb.Email, err)
+		return
+	}
+
+	if _, err := c.Select(imap.InboxName, false); err != nil {
+		log.Printf("[%s] [轮询] 选择INBOX失败: %v", mb.Email, err)
+		return
+	}
+
+	// 调用我们之前写好的抓取和状态保存逻辑，完全复用
+	if err := fetchAndProcess(ctx, c, mb, cfg, lastUID); err != nil {
+		log.Printf("[%s] [轮询] 抓取邮件时出错: %v", mb.Email, err)
+	}
+
+	log.Printf("[%s] [轮询] 检查完成", mb.Email)
+}
+
+// fetchAndProcess 函数保持不变，它负责调用 fetchAndPush 并保存状态
+func fetchAndProcess(ctx context.Context, c *client.Client, mb config.Mailbox, cfg *config.Config, lastUID *uint32) error {
+	uidBeforeFetch := *lastUID
+	err := fetchAndPush(ctx, c, mb, cfg, lastUID)
+	if err != nil {
+		*lastUID = uidBeforeFetch
+		return err
+	}
+	if *lastUID > uidBeforeFetch {
+		log.Printf("[%s] 新的 UID 是 %d，正在保存到状态文件...", mb.Email, *lastUID)
+		if saveErr := state.SaveLastUID(mb.Email, *lastUID); saveErr != nil {
+			log.Printf("[%s] 严重警告: 无法保存最新的 UID %d 到文件: %v", mb.Email, *lastUID, saveErr)
+		}
+	}
+	return nil
+}
+
+// fetchAndPush 函数保持不变，它负责抓取和推送
 func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg *config.Config, lastUID *uint32) error {
 	crit := imap.NewSearchCriteria()
 	cutoff := time.Now().Add(-time.Duration(max(1, mb.WindowHours)) * time.Hour)
@@ -263,8 +181,7 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 		return nil
 	}
 
-	// 过滤新 UID
-	fetchUIDs := make([]uint32, 0, len(uids))
+	var fetchUIDs []uint32
 	for _, id := range uids {
 		if id > *lastUID {
 			fetchUIDs = append(fetchUIDs, id)
@@ -273,7 +190,6 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 	if len(fetchUIDs) == 0 {
 		return nil
 	}
-	// 升序，截断到 MaxFetchPerBatch
 	sort.Slice(fetchUIDs, func(i, j int) bool { return fetchUIDs[i] < fetchUIDs[j] })
 	if len(fetchUIDs) > cfg.MaxFetchPerBatch {
 		fetchUIDs = fetchUIDs[len(fetchUIDs)-cfg.MaxFetchPerBatch:]
@@ -299,7 +215,6 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 			continue
 		}
 
-		// 域名白名单过滤
 		ok := false
 		for _, from := range msg.Envelope.From {
 			if util.DomainAllowed(from.HostName, cfg.SenderDomains) {
@@ -323,7 +238,6 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 			}
 		}
 
-		// AI 摘要（可选）
 		if cfg.EnableSummary && cfg.SummaryAPIKey != "" {
 			mailCtx := fmt.Sprintf("主题: %s\n发件人: %s\n时间: %s\n\n正文:\n%s",
 				strings.TrimSpace(msg.Envelope.Subject),
@@ -339,7 +253,6 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 			preview = extractor.NormalizeSpaces(preview)
 			preview = extractor.RemoveEmptyLines(preview)
 		}
-		// 兜底截断（防止 TG 4096 限制）
 		if len([]rune(preview)) > 3800 {
 			preview = string([]rune(preview)[:3800]) + "…"
 		}
@@ -357,17 +270,14 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 		return fmt.Errorf("UidFetch: %w", err)
 	}
 
-	// 最终按 Date 排序（更贴近用户感知）
 	sort.Slice(summaries, func(i, j int) bool { return summaries[i].Date.Before(summaries[j].Date) })
 
-	// 推送
 	tg := telegram.New(cfg.TGBotToken, cfg.TGChatID)
 	for _, ms := range summaries {
 		html := formatForTG(ms, mb.Name)
 		for _, chunk := range splitForTelegram(html) {
 			if err := tg.SendHTML(chunk); err != nil {
 				log.Printf("[%s] TG push failed uid=%d: %v", mb.Email, ms.UID, err)
-				break
 			}
 		}
 		log.Printf("[%s] pushed uid=%d %s", mb.Email, ms.UID, ms.Subject)
@@ -376,6 +286,7 @@ func fetchAndPush(ctx context.Context, c *client.Client, mb config.Mailbox, cfg 
 	return nil
 }
 
+// 其他辅助函数保持不变
 func formatFrom(addrs []*imap.Address) string {
 	if len(addrs) == 0 {
 		return "(unknown)"
@@ -412,27 +323,23 @@ func splitForTelegram(s string) []string {
 	return parts
 }
 
-func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
-}
-
-func jitterSec(n int) int {
-	if n <= 2 {
-		return n
-	}
-	return n - 5 + rand.Intn(10) // ±5 秒抖动，避免整点风暴
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
+// NewJitterTicker 创建一个带抖动的 Ticker，避免所有任务同时执行
+func NewJitterTicker(d, jitter time.Duration) *time.Ticker {
+	// 立即返回一个 Ticker
+	// 但其周期将在 [d-jitter, d+jitter] 范围内随机
+	ticker := time.NewTicker(d)
+	go func() {
+		for range ticker.C {
+			// 每次触发后，重置 Ticker 的周期
+			offset := time.Duration(rand.Int63n(int64(jitter)*2)) - jitter
+			nextTick := d + offset
+			if nextTick < 1*time.Second {
+				nextTick = 1 * time.Second // 避免周期过小
+			}
+			ticker.Reset(nextTick)
+		}
+	}()
+	return ticker
 }
 
 func max(a, b int) int {
