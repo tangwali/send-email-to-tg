@@ -15,7 +15,7 @@ build:
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build -ldflags "-s -w" -o $(BIN) ./cmd/tgmail-relay
 
 # 2) 本地运行（调试）
-run:
+dev:
 	go run ./cmd/tgmail-relay
 
 # 3) 一键部署：编译 -> 传到 /tmp -> sudo 安装到 /usr/local/bin -> 重启 systemd

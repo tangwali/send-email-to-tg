@@ -83,7 +83,7 @@ func Load() (*Config, error) {
 		TGChatID:            os.Getenv("TELEGRAM_CHAT_ID"),
 		SenderDomains:       domains,
 		SummaryAPIKey:       os.Getenv("OPENAI_API_KEY"), // 兼容你现有命名；建议改为 GOOGLE_API_KEY
-		SummaryModel:        envOr("SUMMARY_MODEL", "gemini-2.0-flash"),
+		SummaryModel:        envOr("SUMMARY_MODEL", "gemini-2.5-flash-lite"),
 		EnableSummary:       parseBoolEnv("ENABLE_SUMMARY", true),
 		IdleFallbackPollSec: parseIntEnv("IDLE_FALLBACK_POLL_SEC", 60),
 		IdleKeepaliveSec:    parseIntEnv("IDLE_KEEPALIVE_SEC", 13*60),
