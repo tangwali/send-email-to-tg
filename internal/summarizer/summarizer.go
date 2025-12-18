@@ -35,13 +35,20 @@ func Summarize(ctx context.Context, cfg Config, text string) string {
 	}
 
 	prompt := fmt.Sprintf(
-		"你是一位可爱风格的资深运营助理，请把下面的完整邮件信息整理成中文正文，要求："+
-			"1) 采用可爱轻松的语气和合理使用emoji；"+
-			"2) 使用清晰标签逐行列出关键信息，只保留主要信息，不要“帮助/设置/温馨提示”等杂讯；过滤掉所有https链接；和其他链接"+
-			"3) 用换行分隔条目，不要空白段落；"+
-			"4) 不要使用 Markdown/HTML，只使用文本！！！！，不要粘贴跟踪链接！！！"+
-			"5) 总长度不超过 800 字；"+
-			"6) 输出只包含摘要正文，不要重复发件人或日期抬头。\n\n邮件内容：\n%s", text)
+		"You are an experienced operations assistant with a cute and friendly writing style. "+
+			"Please summarize the full email content below into a Chinese正文摘要. Requirements:\n"+
+			"1) Use a cute, light, and friendly tone, with reasonable use of emojis;\n"+
+			"2) List key information line by line using clear labels; keep only essential information; "+
+			"remove any noise such as help instructions, setup guides, tips, disclaimers, or promotional text; "+
+			"remove ALL URLs, including https links and any other links;\n"+
+			"3) Separate each item with a single line break; do NOT include empty lines;\n"+
+			"4) Output plain text ONLY — do NOT use Markdown or HTML; do NOT include tracking links;\n"+
+			"5) Total length must not exceed 800 Chinese characters;\n"+
+			"6) Output ONLY the summarized body content; do NOT repeat sender, subject, or date headers;\n"+
+			"7) The FINAL OUTPUT MUST BE IN CHINESE.\n\n"+
+			"Email content:\n%s",
+		text,
+	)
 
 	const maxRetries = 5
 	backoff := 5 * time.Second

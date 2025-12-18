@@ -1,3 +1,4 @@
+VERSION := $(shell TZ="Asia/Shanghai" date +"%y.%m%d.%H%M")
 APP := tgmail-relay
 BIN := $(APP)
 
@@ -30,3 +31,18 @@ deploy: build
 		sudo systemctl restart $(REMOTE_SVC) && \
 		sudo systemctl status $(REMOTE_SVC) --no-pager --lines=3 \
 	"
+
+
+# 提交版本变更到Git
+push-version:
+	(git add . && \
+	git commit -m "bump version to v$(VERSION)" && \
+	git push) || \
+	(echo "Git commit failed"; exit 1)
+
+# 创建并推送标签
+push-tag: push-version
+	@echo "Creating and pushing tag v$(VERSION)"
+	@git tag v$(VERSION) && \
+		git push origin v$(VERSION) || \
+		(echo "Failed to create and push tag"; exit 1)
